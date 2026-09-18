@@ -1,0 +1,175 @@
+import ast,json,time,hashlib,io,base64,re
+from pathlib import Path
+import cv2,numpy as np,yaml
+W,H=1024,768
+CLASSES={0:'背景',1:'道路',2:'车辆',3:'行人',4:'设施',5:'地形',6:'天空'}
+def atomic(p,b):
+ p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_suffix(p.suffix+'.tmp');tmp.write_bytes(b);tmp.replace(p)
+def png(a):return cv2.imencode('.png',a)[1].tobytes()
+def encode(a):return 'data:image/png;base64,'+base64.b64encode(png(a)).decode()
+def decode(s):
+ b=base64.b64decode(s.split(',',1)[1],validate=True);a=cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_GRAYSCALE)
+ if a is None or a.shape!=(H,W):raise ValueError('mask must be 1024x768')
+ return (a>127).astype('uint8')*255
+class Segmenter:
+ def __init__(self,checkpoint,backend='sam',config=None):self.checkpoint=checkpoint;self.backend=backend;self.config=config;self.predictor=None;self.cached=None
+ def predict(self,image,box,points=None,labels=None):
+  import torch
+  torch.set_num_threads(4)
+  if self.predictor is None:
+   if self.backend=='sam':
+    from segment_anything import SamPredictor,sam_model_registry
+    model=sam_model_registry['vit_b'](checkpoint=str(self.checkpoint));model.to('cuda' if torch.cuda.is_available() else 'cpu');self.predictor=SamPredictor(model)
+   else:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    self.predictor=SAM2ImagePredictor(build_sam2(self.config,str(self.checkpoint),device='cuda' if torch.cuda.is_available() else 'cpu'))
+  key=hashlib.sha256(image.tobytes()).digest()
+  with torch.inference_mode():
+   if key!=self.cached:self.predictor.set_image(cv2.cvtColor(image,cv2.COLOR_BGR2RGB));self.cached=key
+   masks,scores,_=self.predictor.predict(box=np.array(box,dtype=np.float32) if box is not None else None,point_coords=np.array(points,dtype=np.float32) if points else None,point_labels=np.array(labels,dtype=np.int32) if points else None,multimask_output=True)
+  return masks[int(np.argmax(scores))].astype('uint8')*255,float(np.max(scores))
+class Project:
+ def __init__(self,scene,out,segmenter):
+  self.scene=Path(scene).resolve();self.out=Path(out).resolve();self.out.mkdir(parents=True,exist_ok=True);self.seg=segmenter;self.images={};self.frames=sorted({p.stem for c in range(6) for p in (self.scene/'mav0'/f'cam{c}'/'data').glob('*.png')},key=float)
+  if not self.frames:raise ValueError('No timestamp PNG images under scene/mav0/cam*/data')
+  f=self.out/'project.json';self.state=json.loads(f.read_text()) if f.exists() else dict(scene=str(self.scene),next_id=1,objects={},frames={},schema=1)
+  if self.state['scene']!=str(self.scene):raise ValueError('Output belongs to another scene')
+  self.cal=self.calibration();self.save()
+ def save(self):atomic(self.out/'project.json',json.dumps(self.state,ensure_ascii=False,indent=2).encode())
+ def calibration(self):
+  f=self.scene/'calib/cameras.py';tree=ast.parse(f.read_text());n=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='extrinsics' for t in n.targets));d={'np':np};exec(compile(ast.Module(body=[n],type_ignores=[]),'cal','exec'),d);cal={}
+  for file in (self.scene/'calib/Intrinsic').glob('*.yaml'):
+   for v in yaml.safe_load(file.read_text()).values():
+    if not isinstance(v,dict) or 'intrinsics' not in v:continue
+    m=re.search(r'cam(\d)',v.get('rostopic',''))
+    if not m:continue
+    c=int(m.group(1));fx,fy,cx,cy=v['intrinsics'];rw,rh=v['resolution'];K=np.array([[fx*W/rw,0,cx*W/rw],[0,fy*H/rh,cy*H/rh],[0,0,1.]])
+    cal[c]=(K,np.array(v['distortion_coeffs']),d['extrinsics'][c]['R'],d['extrinsics'][c]['t'])
+  return cal
+ def image(self,f,c):
+  f=int(f);c=int(c)
+  if not 0<=f<len(self.frames) or c not in range(6):raise ValueError('invalid frame/camera')
+  key=(f,c)
+  if key not in self.images:
+   p=self.scene/'mav0'/f'cam{c}'/'data'/(self.frames[f]+'.png');im=cv2.imread(str(p)) if p.exists() else None
+   if im is None:raise ValueError('该时间戳缺少此相机图片')
+   self.images[key]=cv2.resize(im,(W,H))
+   if len(self.images)>18:self.images.pop(next(iter(self.images)))
+  return self.images[key]
+ def entries(self,f,c):return self.state['frames'].get(str(f),{}).get(str(c),{})
+ def mask(self,e):return cv2.imread(str(self.out/e['mask']),0)
+ def put(self,f,c,obj,mask,origin,reviewed=False):
+  if int(mask.sum())==0:return
+  name=f'masks/{f:06d}/cam{c}/{obj}_{time.time_ns()}.png';atomic(self.out/name,png(mask));self.state['frames'].setdefault(str(f),{}).setdefault(str(c),{})[str(obj)]=dict(mask=name,origin=origin,reviewed=reviewed)
+ def refresh_exports(self,frames):
+  for f in frames:
+   if any((self.out/'exports'/f'cam{c}'/(self.frames[f]+'.png')).exists() for c in range(6)):self.export(f)
+ def invalidate(self,f,obj):
+  affected=[]
+  for fi,cams in self.state['frames'].items():
+   if int(fi)<=f:continue
+   for entries in cams.values():
+    e=entries.get(str(obj))
+    if e and e['origin']!='manual':entries.pop(str(obj));affected.append(int(fi))
+  return affected
+ def add(self,d):
+  f=int(d['frame']);c=int(d['cam']);self.image(f,c);m=decode(d['mask']);obj=str(d.get('object',''))
+  if not m.any():raise ValueError('区域为空，未保存')
+  if not obj:
+   cls=int(d['class_id'])
+   if cls not in CLASSES:raise ValueError('unknown class')
+   obj=str(self.state['next_id']);self.state['next_id']+=1;self.state['objects'][obj]=dict(class_id=cls,start=f,stop=None)
+  if obj not in self.state['objects']:raise ValueError('unknown object')
+  o=self.state['objects'][obj]
+  if o['stop'] is not None and f>=o['stop']:raise ValueError('此目标已停止追踪，请新建目标')
+  affected=self.invalidate(f,obj);self.put(f,c,obj,m,'manual',True);self.save();self.refresh_exports(set(affected+[f]));return obj
+ def stop(self,f,obj):
+  obj=str(obj)
+  if obj not in self.state['objects']:raise ValueError('unknown object')
+  self.state['objects'][obj]['stop']=int(f)
+  affected=[]
+  for fi,cams in self.state['frames'].items():
+   if int(fi)>=f:
+    affected.append(int(fi))
+    for entries in cams.values():entries.pop(obj,None)
+  self.save();self.refresh_exports(affected)
+ def temporal(self,f):
+  if f<=0:return []
+  warnings=[]
+  for c in range(6):
+   old=self.entries(f-1,c)
+   if not old:continue
+   try:a=self.image(f-1,c);b=self.image(f,c)
+   except ValueError:continue
+   if float(self.frames[f])-float(self.frames[f-1])>1: warnings.append(f'cam{c}: 时间间隔超过1秒，未自动追踪');continue
+   ga=cv2.cvtColor(a,cv2.COLOR_BGR2GRAY);gb=cv2.cvtColor(b,cv2.COLOR_BGR2GRAY)
+   for obj,e in list(old.items()):
+    o=self.state['objects'][obj]
+    if (o['stop'] is not None and f>=o['stop']) or obj in self.entries(f,c):continue
+    mask=self.mask(e);pts=cv2.goodFeaturesToTrack(ga,150,.01,7,mask=mask)
+    if pts is None or len(pts)<6:warnings.append(f'cam{c} 目标{obj}: 特征不足');continue
+    q,ok,_=cv2.calcOpticalFlowPyrLK(ga,gb,pts,None);back,ok2,_=cv2.calcOpticalFlowPyrLK(gb,ga,q,None);valid=(ok[:,0]>0)&(ok2[:,0]>0)&(np.linalg.norm(back[:,0]-pts[:,0],axis=1)<1.5)
+    if valid.sum()<6:continue
+    A,ins=cv2.estimateAffinePartial2D(pts[valid],q[valid],method=cv2.RANSAC,ransacReprojThreshold=3)
+    if A is None or ins.sum()<6 or ins.mean()<.5:continue
+    scale=np.linalg.norm(A[:,0])
+    if not .65<scale<1.5:continue
+    moved=cv2.warpAffine(mask,A,(W,H),flags=cv2.INTER_NEAREST);ys,xs=np.where(moved>0)
+    if len(xs)<30:continue
+    box=[max(0,int(xs.min())-4),max(0,int(ys.min())-4),min(W-1,int(xs.max())+4),min(H-1,int(ys.max())+4)]
+    try:
+     refined,score=self.seg.predict(b,box);union=np.count_nonzero((refined>0)|(moved>0));iou=np.count_nonzero((refined>0)&(moved>0))/max(union,1)
+     if score<.6 or iou<.25:warnings.append(f'cam{c} 目标{obj}: SAM一致性不足，暂停传播');continue
+     self.put(f,c,obj,refined,'temporal_sam',False)
+    except Exception as ex:warnings.append('SAM追踪失败: '+str(ex))
+  self.save();return warnings
+ def cross(self,f,source,obj):
+  e=self.entries(f,source).get(str(obj))
+  if not e:raise ValueError('源相机没有此目标标注')
+  a=self.image(f,source);mask=self.mask(e);sift=cv2.SIFT_create(nfeatures=6000);ka,da=sift.detectAndCompute(cv2.cvtColor(a,cv2.COLOR_BGR2GRAY),mask);log=[]
+  if da is None or len(ka)<8:return ['跨相机特征不足，未建立关联']
+  Ki,di,Ri,ti=self.cal[source]
+  for c in range(6):
+   if c==source or str(obj) in self.entries(f,c) or c not in self.cal:continue
+   try:
+    b=self.image(f,c);kb,db=sift.detectAndCompute(cv2.cvtColor(b,cv2.COLOR_BGR2GRAY),None)
+    if db is None:continue
+    bf=cv2.BFMatcher();pairs=bf.knnMatch(da,db,k=2);rev={v[0].queryIdx:v[0].trainIdx for v in bf.knnMatch(db,da,k=2) if len(v)==2 and v[0].distance<.75*v[1].distance};good=[v[0] for v in pairs if len(v)==2 and v[0].distance<.75*v[1].distance and rev.get(v[0].trainIdx)==v[0].queryIdx]
+    if len(good)<8:continue
+    x=np.float32([ka[m.queryIdx].pt for m in good]);y=np.float32([kb[m.trainIdx].pt for m in good]);Kj,dj,Rj,tj=self.cal[c];R=Rj.T@Ri;t=Rj.T@(ti-tj);tx=np.array([[0,-t[2],t[1]],[t[2],0,-t[0]],[-t[1],t[0],0]]);E=tx@R
+    xn=cv2.undistortPoints(x[:,None],Ki,di)[:,0];yn=cv2.undistortPoints(y[:,None],Kj,dj)[:,0];xh=np.column_stack([xn,np.ones(len(x))]);yh=np.column_stack([yn,np.ones(len(y))]);l=xh@E.T;l2=yh@E;num=np.abs(np.sum(yh*l,axis=1));err=np.maximum(num/np.maximum(np.linalg.norm(l[:,:2],axis=1),1e-9),num/np.maximum(np.linalg.norm(l2[:,:2],axis=1),1e-9))*max(Ki[0,0],Kj[0,0]);good=err<3
+    if good.sum()<8:continue
+    target=y[good];xmin,ymin=target.min(0);xmax,ymax=target.max(0)
+    if (xmax-xmin)*(ymax-ymin)<100:continue
+    box=[max(0,xmin-12),max(0,ymin-12),min(W-1,xmax+12),min(H-1,ymax+12)];m,score=self.seg.predict(b,box,points=target.tolist(),labels=[1]*len(target))
+    inside=np.mean(m[np.clip(target[:,1].astype(int),0,H-1),np.clip(target[:,0].astype(int),0,W-1)]>0)
+    if score<.6 or inside<.8:continue
+    self.put(f,c,obj,m,'cross_camera_suggestion',False);log.append(f'目标{obj} → cam{c}: 自动关联候选（需审核）')
+   except Exception as ex:log.append(f'cam{c}: '+str(ex))
+  self.save();return log or ['无可靠跨相机对应；可选择同一目标ID在另一相机手绘，手工关联']
+ def data(self,f):
+  cameras=[]
+  for c in range(6):
+   try:self.image(f,c);exists=True
+   except ValueError:exists=False
+   entries=[]
+   for obj,e in self.entries(f,c).items():
+    o=self.state['objects'][obj]
+    if o['stop'] is not None and f>=o['stop']:continue
+    entries.append(dict(id=obj,**o,**e,mask_data=encode(self.mask(e))))
+   cameras.append(dict(cam=c,exists=exists,entries=entries))
+  return dict(frame=f,timestamp=self.frames[f],count=len(self.frames),cameras=cameras,objects=self.state['objects'],classes=CLASSES)
+ def export(self,f):
+  result=[]
+  for c in range(6):
+   entries=self.entries(f,c)
+   p=self.scene/'mav0'/f'cam{c}'/'data'/(self.frames[f]+'.png');im=cv2.imread(str(p)) if p.exists() else None
+   if im is None:continue
+   h,w=im.shape[:2];label=np.full((H,W),255,np.uint8);inst=np.zeros((H,W),np.uint16)
+   # Background/stuff first, instances last; deterministic ID precedence.
+   for obj,e in sorted(entries.items(),key=lambda z:(self.state['objects'][z[0]]['class_id'] in [2,3],int(z[0]))):
+    if not e['reviewed']:continue
+    m=self.mask(e)>0;label[m]=self.state['objects'][obj]['class_id'];inst[m]=int(obj)
+   folder=self.out/'exports'/f'cam{c}';atomic(folder/(self.frames[f]+'.png'),png(cv2.resize(label,(w,h),interpolation=cv2.INTER_NEAREST)));atomic(folder/(self.frames[f]+'_instance.png'),png(cv2.resize(inst,(w,h),interpolation=cv2.INTER_NEAREST)));result.append(str(folder))
+  atomic(self.out/'exports/classes.json',json.dumps(dict(classes=CLASSES,ignore=255,working_resolution=[W,H],note='nearest-neighbor upsample to original size; unreviewed and unlabelled remain ignore'),ensure_ascii=False,indent=2).encode());return result

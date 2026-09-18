@@ -1,0 +1,15 @@
+{
+  "torch": "2.5.1+cu121",
+  "cuda_runtime": "12.1",
+  "device": "NVIDIA GeForce RTX 2080 Ti",
+  "compute_capability": [
+    7,
+    5
+  ],
+  "sam_device": "cuda:0",
+  "first_inference_s": 1.3114522750256583,
+  "cached_image_inference_s": 0.00554029003251344,
+  "mask_pixels": 41171,
+  "score": 0.888778805732727,
+  "allocated_mb": 370.83642578125
+}
